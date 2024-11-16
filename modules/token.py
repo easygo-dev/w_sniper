@@ -6,6 +6,9 @@ from modules.config import logger, ZERO_ADDRESS
 import settings
 
 class Token(Wallet):
+    _insufficient_balance_reported = False
+    _last_working_balance = None
+
     def __init__(self, private_key, counter, coin_data):
         super().__init__(private_key, counter)
         self.coin = coin_data
@@ -35,6 +38,10 @@ class Token(Wallet):
             volume = float(self.coin.get('getMarketStats', {}).get('volume', '0'))
             
             if volume >= settings.MIN_VOLUME_USD:
+                # Проверяем, не купили ли уже этот токен
+                if self.coin['address'] in self.volume_tracker.bought_tokens:
+                    return False
+
                 # Уведомление о найденном токене
                 found_msg = (
                     f"🔍 Found token with sufficient volume:\n"
@@ -47,18 +54,41 @@ class Token(Wallet):
                 logger.info(found_msg)
                 if settings.TELEGRAM_ENABLED:
                     send_telegram_message(found_msg)
-    
-                if self.coin['address'] in self.volume_tracker.bought_tokens:
-                    return False
-    
-                # Далее логика покупки...
+
+                # Проверяем баланс кошелька
                 wei_amount = wei(settings.BUY_AMOUNT_ETH)
-                if wei_amount >= self.get_balance():
-                    logger.warning(
-                        f"{self.label} Amount {ether(wei_amount):.6f} ETH exceeds wallet balance, skipping\n"
-                    )
+                current_balance = self.get_balance()
+                
+                if wei_amount >= current_balance:
+                    if not Token._insufficient_balance_reported:
+                        msg = (
+                            f"⚠️ Insufficient balance! Bot paused.\n"
+                            f"Wallet: {self.address}\n"
+                            f"Required: {settings.BUY_AMOUNT_ETH} ETH\n"
+                            f"Current balance: {ether(current_balance):.6f} ETH"
+                        )
+                        logger.warning(msg)
+                        if settings.TELEGRAM_ENABLED:
+                            send_telegram_message(msg)
+                        Token._insufficient_balance_reported = True
                     return False
-    
+                else:
+                    # Если баланс был недостаточен, а теперь достаточен
+                    if Token._insufficient_balance_reported:
+                        msg = (
+                            f"✅ Balance restored!\n"
+                            f"Wallet: {self.address}\n"
+                            f"Current balance: {ether(current_balance):.6f} ETH\n"
+                            f"Resuming operations..."
+                        )
+                        logger.info(msg)
+                        if settings.TELEGRAM_ENABLED:
+                            send_telegram_message(msg)
+                        Token._insufficient_balance_reported = False
+
+                Token._last_working_balance = current_balance
+
+                # Рассчитываем и исполняем покупку
                 token_amount = self.calc_token_amount(float(self.coin['usdPrice']) * settings.BUY_AMOUNT_ETH)
                 order_size = max(token_amount, self.min_size)
     
@@ -95,7 +125,8 @@ class Token(Wallet):
                         f"Amount: {settings.BUY_AMOUNT_ETH} ETH\n"
                         f"Volume: ${volume:.2f}\n"
                         f"Price: ${float(self.coin['usdPrice']):.8f}\n"
-                        f"TX: {tx_receipt['transactionHash'].hex()}"
+                        f"TX: {tx_receipt['transactionHash'].hex()}\n"
+                        f"Remaining balance: {ether(self.get_balance()):.6f} ETH"
                     )
                     logger.success(buy_msg)
                     if settings.TELEGRAM_ENABLED:
